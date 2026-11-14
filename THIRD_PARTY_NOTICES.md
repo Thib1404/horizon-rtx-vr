@@ -413,3 +413,10 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FO
 OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+## The stars
+
+`crates/horizon-client-render/src/gfx/stars_bsc5.bin` holds the stars of the Yale Bright Star Catalogue, 5th revised
+edition (Hoffleit and Warren, 1991; in the public domain), as converted to JSON by Bretton Wade's
+[YaleBrightStarCatalog](https://github.com/brettonw/YaleBrightStarCatalog) (MIT License, Copyright (c) Bretton
+Wade), then packed to eight bytes a star (`gfx/sky_stars.rs`).

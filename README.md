@@ -1,3 +1,39 @@
+# Horizon RTX + VR (Thib1404's fork)
+
+> **This is not the official Horizon.** It is a fork of [horizon-rust/horizon](https://github.com/horizon-rust/horizon) by
+> Thib1404, with a hardware ray-traced renderer, VR for the Apple Vision Pro and sound physics. The official project,
+> its downloads, its Discord and its support are upstream: the sections below this one are upstream's README, kept as
+> they are. Nothing here is endorsed by Horizon's maintainers.
+
+**What it adds** (all off by default, so with default settings the game draws as upstream does):
+
+- **Ray-traced lighting** (`rtLighting`, `linearLight`, `rayTracedShadows`, `rayTracedAo`, and the `rtx` build
+  feature for the raw Vulkan parts): sun and moon shadows, AO, ReSTIR GI, reflections, a ReLAX denoiser, a radiance
+  cache, a physical sky with real stars, the moon and the planets, volumetric fog and clouds, LabPBR materials and
+  parallax, rain and snow, wind. See [docs/raytracing.md](docs/raytracing.md).
+- **VR** (`vr:true` in `horizon-graphics.txt`, or `HORIZON_XR=1`): OpenXR stereo with both eyes sharing the ray
+  tracing, foveated rendering, gaze aiming. See [docs/vr.md](docs/vr.md).
+- **Sound physics**: occlusion, reverb from the rooms around the player, binaural sound and Doppler.
+
+**Built for an RTX 4090, for now.** It was written and tuned on an RTX 4090 (Windows, Vulkan), on a monitor and in
+VR at 4400x3520 per eye. Other GPUs will run it slower, and some parts need hardware ray tracing. It hasn't been
+optimised for them yet. The measurements are in [docs/rtx-4090.md](docs/rtx-4090.md).
+
+**Made with AI.** The code was written by AI agents (Claude Code, with Claude Fable 5.2 and Claude Opus 5.5), directed
+and play-tested by Thib1404.
+
+**Relation to upstream.** The whole fork was offered to Horizon in one block in
+[horizon-rust/horizon#16545](https://github.com/horizon-rust/horizon/pull/16545), which says openly that it breaks
+the project's rules on size and specs. Upstream's own ray tracing plan (#13780, #15624, #16011) gives the look to
+shader packs instead, so the parts upstream wants will go there as small pull requests, and the rest stays here.
+This branch is the same code as that pull request: DLSS Ray Reconstruction (NVIDIA's SDK can't be published) and the
+copper projector mod are left out.
+
+**Build:** `cargo build --profile fast -p horizon-client --features rtx`. You need your own Minecraft: Java Edition
+install, as for upstream Horizon (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+---
+
 <p align="center">
   <img src="docs/media/banner.webp" alt="Horizon: the game you know, rebuilt in Rust" width="100%">
 </p>
