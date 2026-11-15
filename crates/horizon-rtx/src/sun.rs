@@ -96,7 +96,8 @@ pub struct SunPass {
     /// Which ray generations run.
     kinds: Kinds,
     /// The push constants' flags (bit 0: reorder, bit 1: the wind, bits 2 and 3: the bounced
-    /// light's turns as the kernel's `GI_TURN_BITS`, bit 4: the kernel's `SKIP` 16, no resting).
+    /// light's turns as the kernel's `GI_TURN_BITS`, bit 4: the kernel's `SKIP` 16, no resting,
+    /// bit 5: its `SKIP_GI_JACOBIAN`, bit 6: its `SKIP_NORMAL_NEAREST`).
     flags: u32,
     /// The outputs, a texel a ray, the mask's size: the sun's light through (`Rgba16Float`), the
     /// bounce pass's hit and what it is (`Rgba32Float`) and its face, colour and sun light
@@ -406,6 +407,41 @@ impl SunPass {
             pass.flags = u32::from(reorder()) | if wind_skipped() { 0 } else { 2 };
             // Bits 2 and 3, bit 4: gi.rgen rests its tiles on the kernel's own turns.
             pass.flags |= gi_turn_bits() << 2 | if skipped(16) { 16 } else { 0 };
+            // Bit 5: the neighbours' samples with a Jacobian of 1, as before (HORIZON_RT_SKIP bit
+            // 16777216, the kernel's `SKIP_GI_JACOBIAN`).
+            pass.flags |= if skipped(16_777_216) { 32 } else { 0 };
+            // Bit 6: a pixel's normal from its nearer neighbours, as before (HORIZON_RT_SKIP bit
+            // 67108864, the kernel's `SKIP_NORMAL_NEAREST`), in both ray generations.
+            pass.flags |= if skipped(67_108_864) { 64 } else { 0 };
+            // Bits 7 to 15: which reservoirs ReSTIR GI merges and how many candidates it keeps
+            // (the kernel's `GI_REUSE` and `GI_HISTORY`).
+            pass.flags |= gi_reuse() << 7 | gi_history() << 9;
+            // Bit 16: the neighbours' samples merged unseen, as before
+            // (`HORIZON_RT_GI_NEIGHBOUR_RAYS=0`, the kernel's `GI_NEIGHBOUR_RAYS`).
+            if !gi_neighbour_rays() {
+                pass.flags |= 1 << 16;
+            }
+            // Bit 17: every neighbour's sample taken as unseen (`=reject`, a diagnosis).
+            if std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() == Ok("reject") {
+                pass.flags |= 1 << 17;
+            }
+            // Bit 18: no light but the sun's at a bounce's hit (`HORIZON_RT_GI_ONE_BOUNCE=1`).
+            if std::env::var("HORIZON_RT_GI_ONE_BOUNCE").as_deref() == Ok("1") {
+                pass.flags |= 1 << 18;
+            }
+            // Bit 19: the neighbours merged here too and fed back to the next frame, as before
+            // (`HORIZON_RT_GI_SPATIAL_FEEDBACK=1`); clear, the kernel merges them for this frame.
+            if std::env::var("HORIZON_RT_GI_SPATIAL_FEEDBACK").as_deref() == Ok("1") {
+                pass.flags |= 1 << 19;
+            }
+            // Bits 20-21: the light at a bounce's hit besides the sun's (`HORIZON_RT_GI_BOUNCE`:
+            // 1 `cache` only, 2 `screen` only, 3 `traced`, neither).
+            pass.flags |= gi_bounce() << 20;
+            // Bit 22: the last frame's masks read at their texels' centres, as before
+            // (`HORIZON_RT_REPROJECT_CENTRE=0`; the kernel's `mask_texel_of`).
+            if std::env::var("HORIZON_RT_REPROJECT_CENTRE").as_deref() == Ok("0") {
+                pass.flags |= 1 << 22;
+            }
             log::info!(
                 "Horizon RTX: a ray tracing pipeline for {}{}{}, shader execution reordering {}",
                 if kinds.sun { "the sun pass" } else { "" },
@@ -1124,6 +1160,44 @@ fn skipped(bit: u32) -> bool {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .is_some_and(|s| s & bit != 0)
+}
+
+/// Which reservoirs ReSTIR GI merges (horizon-client-render gfx/shadow_rays.rs `gi_reuse`, the
+/// same rule): `HORIZON_RT_GI_REUSE=temporal` the last frame's alone (1), `none` none (2).
+fn gi_reuse() -> u32 {
+    match std::env::var("HORIZON_RT_GI_REUSE").as_deref() {
+        Ok("temporal") => 1,
+        Ok("none") => 2,
+        Ok("spatial") => 3,
+        _ => 0,
+    }
+}
+
+/// The light at a bounce's hit besides the sun's (horizon-client-render gfx/shadow_rays.rs
+/// `gi_bounce`, the same rule): `HORIZON_RT_GI_BOUNCE=cache` (1), `screen` (2), `traced` (3).
+fn gi_bounce() -> u32 {
+    match std::env::var("HORIZON_RT_GI_BOUNCE").as_deref() {
+        Ok("cache") => 1,
+        Ok("screen") => 2,
+        Ok("traced") => 3,
+        _ => 0,
+    }
+}
+
+/// Whether ReSTIR GI checks each neighbour's sample is seen before merging it
+/// (`HORIZON_RT_GI_NEIGHBOUR_RAYS=0`: no, as before).
+fn gi_neighbour_rays() -> bool {
+    std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() != Ok("0")
+}
+
+/// The candidates a GI reservoir keeps at most (`HORIZON_RT_GI_HISTORY`, 1 to 100), 0 for the
+/// default 20.
+fn gi_history() -> u32 {
+    std::env::var("HORIZON_RT_GI_HISTORY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| (1..=100).contains(v))
+        .unwrap_or(0)
 }
 
 /// The bounced light's turns as the trace kernel takes them (horizon-client-render

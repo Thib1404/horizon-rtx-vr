@@ -47,6 +47,9 @@ pub struct PostParams {
     pub highlights: f32,
     pub sigma: f32,
     pub offset: f32,
+    /// How much of the deep shade's lift (`deep_lift`) applies: 1 by day, 0 at dusk, by night and
+    /// in the rain (their dark stays dark, even on a porch where `indoors` raises the top).
+    pub deep: f32,
 }
 
 /// Remix's units of luminance in paper white's: Remix lights a scene in units where a lit surface
@@ -55,6 +58,23 @@ pub struct PostParams {
 const REMIX_UNITS: f32 = 200.0;
 /// The local tone mapping exposure at which Remix's own scale is the scene's, 1.
 const REMIX_EXPOSURE: f32 = 0.214_057_28;
+
+/// How many stops the deep shade is lifted by day (`PostParams::deep_lift`): under a dark oak
+/// canopy the light is about a thousandth of paper white, and on an RTX 4090 a lift near 5 stops
+/// (local shadows 8 with 2.5 stops more exposure) made it readable; the ramp (tonemap.wgsl) gives
+/// a floor eight stops under the preferred level about three of them.
+const DEEP_LIFT: f32 = 5.0;
+/// `DEEP_LIFT`, or `HORIZON_TONE_DEEP`'s stops (0 to 8, 0 off).
+fn deep_lift_stops() -> f32 {
+    static STOPS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *STOPS.get_or_init(|| deep_stops_of(std::env::var("HORIZON_TONE_DEEP").ok().as_deref()))
+}
+fn deep_stops_of(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| (0.0..=8.0).contains(v))
+        .unwrap_or(DEEP_LIFT)
+}
 
 /// `PostParams::INDOOR_EV_MAX`, or `HORIZON_INDOOR_EV_MAX`'s stops (-2 to 6).
 fn indoor_ev_max() -> f32 {
@@ -79,9 +99,11 @@ impl PostParams {
         highlights: 2.5,
         sigma: 3.5,
         offset: -0.1,
+        deep: 1.0,
     };
     /// Remix's dusk: the exposure's top lowered to -0.5 stops.
     pub const DUSK: Self = Self {
+        deep: 0.0,
         ev_max: -0.5,
         ..Self::REMIX
     };
@@ -90,6 +112,7 @@ impl PostParams {
     /// 1 of its units, a two-hundredth of white: every lit thing glowed, a lamp's room was a veil
     /// and the moon a white ball in a halo, its maria gone.
     pub const NIGHT: Self = Self {
+        deep: 0.0,
         ev_max: -0.5,
         bloom_burn: 0.2,
         ..Self::REMIX
@@ -97,6 +120,7 @@ impl PostParams {
     /// Remix's night: the top at -0.5, a bloom that burns at 1.5 over anything above 1
     /// (`HORIZON_NIGHT_BLOOM=remix`).
     pub const NIGHT_REMIX: Self = Self {
+        deep: 0.0,
         ev_max: -0.5,
         bloom_burn: 1.5,
         bloom_threshold: 1.0,
@@ -113,12 +137,14 @@ impl PostParams {
     }
     /// Remix's rain: the top at -1, shadows at 1.75.
     pub const RAIN: Self = Self {
+        deep: 0.0,
         ev_max: -1.0,
         shadows: 1.75,
         ..Self::REMIX
     };
     /// Remix's thunder: the top at -1, shadows at 2.
     pub const THUNDER: Self = Self {
+        deep: 0.0,
         ev_max: -1.0,
         shadows: 2.0,
         ..Self::REMIX
@@ -145,6 +171,15 @@ impl PostParams {
             ev_max: self.ev_max + (indoor_ev_max() - self.ev_max).max(0.0) * inside,
             ..self
         }
+    }
+
+    /// The deep shadows' lift in stops (tonemap.wgsl `deep_lift`): `DEEP_LIFT` (or
+    /// `HORIZON_TONE_DEEP`'s, 0 off) times `deep`, so by day only. It works on the light after
+    /// the exposure, so a room the exposure has adapted to sits near the preferred level and
+    /// keeps its contrast; only what stays far under it, as a forest's floor under an open sky
+    /// holding the exposure down, is lifted.
+    pub fn deep_lift(&self) -> f32 {
+        deep_lift_stops() * self.deep
     }
 
     /// These for a headset's eye: 0.4 stops brighter (`HORIZON_VR_EXPOSURE_STOPS` sets another, 0
@@ -183,7 +218,7 @@ impl PostParams {
             tone("SIGMA").unwrap_or(self.sigma),
             tone("OFFSET").unwrap_or(self.offset),
             0.0,
-            0.0,
+            self.deep_lift(),
             0.0,
         ]
     }
@@ -1151,5 +1186,29 @@ mod tests {
             assert_eq!(half.ev_min, situation.ev_min);
             assert_eq!(half.exposure, situation.exposure);
         }
+    }
+
+    #[test]
+    fn the_deep_shade_is_lifted_by_day_only() {
+        assert_eq!(PostParams::REMIX.indoors(0).deep, 1.0);
+        // A porch at night raises the exposure's top but must not lift the night's dark.
+        for dark in [
+            PostParams::DUSK,
+            PostParams::NIGHT,
+            PostParams::RAIN,
+            PostParams::THUNDER,
+        ] {
+            assert_eq!(dark.deep, 0.0);
+            assert_eq!(dark.indoors(6).deep, 0.0);
+        }
+    }
+
+    #[test]
+    fn the_deep_lift_takes_its_stops_from_the_switch() {
+        assert_eq!(super::deep_stops_of(None), super::DEEP_LIFT);
+        assert_eq!(super::deep_stops_of(Some("0")), 0.0);
+        assert_eq!(super::deep_stops_of(Some(" 5.5 ")), 5.5);
+        assert_eq!(super::deep_stops_of(Some("12")), super::DEEP_LIFT);
+        assert_eq!(super::deep_stops_of(Some("off?")), super::DEEP_LIFT);
     }
 }

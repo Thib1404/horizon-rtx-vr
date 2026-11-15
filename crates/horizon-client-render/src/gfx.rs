@@ -296,7 +296,7 @@ pub use rt_switches::rt_ambient_default;
 use rt_switches::{
     COVER_FORMAT, EyeDepths, EyeLists, RT_AMBIENT, SkyLast, WorldPrepass, cover_texture,
     half_prepass, outline_sways, prepass_split, psr_cover, rt_debug, rt_gpu_mobs, rt_hand_shadow,
-    rt_shore, rt_steps, sky_last, sun_rise, world_prepass,
+    rt_shore, rt_steps, rt_stream_with_switches, sky_last, sun_rise, world_prepass,
 };
 mod graded_capture;
 pub use rt_clouds::{cover as cloud_cover, set_cover as set_cloud_cover};
@@ -8146,7 +8146,7 @@ impl Renderer {
                 None => [-1.0, 0.0, self.ice_layers, rt_shore(self.rt_ambient_light)],
             },
             rt_shower: meteors.radiant,
-            rt_stream: meteors.stream,
+            rt_stream: rt_stream_with_switches(meteors.stream),
             rain: [
                 frame.rain.rate,
                 frame.wetness.wet,

@@ -93,6 +93,23 @@ fn usable(c: vec3<f32>) -> vec3<f32> {
 // pass as before the early-out (`filter_before`), to time and compare the two.
 override SKIP: u32 = 0u;
 const SKIP_EARLY_OUT: u32 = 4194304u;
+// `HORIZON_RT_DENOISE_PLANE=0`: a tap's distance weighed against the centre's along the view
+// rays, as before. By default a tap on the centre's face also counts by its distance from the
+// centre's plane, whichever is nearer (ReLAX's plane distance): on a surface seen at a grazing
+// angle the distance along the rays climbs fast across the iso-distance lines, so the filter
+// blurred only along them and drew the bounced light's noise out in streaks (a ceiling's corner
+// above a lit floor or a red wall).
+override DENOISE_PLANE: bool = true;
+// Mask texel `p`'s view ray, camera-relative, at the far plane's depth (as `sharp_block`): affine
+// in the texel, the camera at the origin.
+fn view_ray(p: vec2<i32>) -> vec3<f32> {
+    let scale = i32(rt.size.z);
+    let pixel = p * scale + scale / 2;
+    let ndc = vec2((f32(pixel.x) + 0.5) / rt.size.x * 2.0 - 1.0,
+        1.0 - (f32(pixel.y) + 0.5) / rt.size.y * 2.0);
+    let c = rt.inverse_view_proj * vec4(ndc, 1.0, 1.0);
+    return c.xyz / c.w;
+}
 // A pixel's history when full (shadow_rays.wgsl `MAX_HISTORY`).
 const FULL_HISTORY: f32 = 30.0;
 // The noise a pass may find left in a pixel with a full history, as a share of its light, below
@@ -301,6 +318,14 @@ fn filter_before(p: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
     // a distance below 0. The centre's are its own.
     var taps: array<vec3<f32>, 9>;
     var depths: array<f32, 9>;
+    // How far each tap lies off the centre's surface (`DENOISE_PLANE`): its distance along the
+    // rays, or from the centre's plane where that is nearer.
+    var off: array<f32, 9>;
+    let axis = i32(floor(face / 2.0));
+    let r0 = view_ray(p);
+    let rx = view_ray(p + vec2(1, 0)) - r0;
+    let ry = view_ray(p + vec2(0, 1)) - r0;
+    let at = normalize(r0) * d0;
     for (var y = 0; y < 3; y++) {
         for (var x = 0; x < 3; x++) {
             let i = y * 3 + x;
@@ -308,6 +333,7 @@ fn filter_before(p: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
             if x == 1 && y == 1 {
                 taps[i] = own;
                 depths[i] = d0;
+                off[i] = 0.0;
                 continue;
             }
             let q = clamp(p + vec2(x - 1, y - 1) * step, vec2(0), size - 1);
@@ -319,6 +345,11 @@ fn filter_before(p: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
             if c.a < 0.0 { continue; }
             taps[i] = signal_of(c.rgb, there.rgb, first);
             depths[i] = d;
+            off[i] = abs(d - d0);
+            if DENOISE_PLANE {
+                let o = vec2<f32>(q - p);
+                off[i] = min(off[i], abs((normalize(r0 + rx * o.x + ry * o.y) * d - at)[axis]));
+            }
         }
     }
     var light = own;
@@ -344,7 +375,7 @@ fn filter_before(p: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
             let d = depths[i];
             if d < 0.0 { continue; }
             let s = taps[i];
-            let w = KERNEL[x] * KERNEL[y] * exp(-abs(d - d0) / tolerance)
+            let w = KERNEL[x] * KERNEL[y] * exp(-off[i] / tolerance)
                 * exp(-abs(luminance(s) - l0) / spread);
             sum += s * w;
             weight += w;

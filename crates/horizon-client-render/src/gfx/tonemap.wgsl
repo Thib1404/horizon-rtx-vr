@@ -96,7 +96,8 @@ struct Params {
     bloom: vec4<f32>,
     // Local tone mapping: exposure (relative to Remix's 0.21405728), shadows, highlights, sigma.
     local: vec4<f32>,
-    // Its exposure preference offset; y the night vision's shift in stops.
+    // Its exposure preference offset; y the night vision's shift in stops; z the deep shadows' lift
+    // in stops (`deep_lift`, 0 off).
     local_offset: vec4<f32>,
 };
 @group(1) @binding(3) var<uniform> params: Params;
@@ -113,7 +114,21 @@ fn local_tone(light: vec3<f32>, average: f32) -> vec3<f32> {
     let at = log2(max(average, 1e-4)) + stops - (PREFERRED_STOPS + params.local_offset.x);
     let w = exp(-at * at / (2.0 * params.local.w * params.local.w));
     let fused = dot(w, exp2(stops)) / max(w.x + w.y + w.z, 1e-6);
-    return light * fused;
+    return light * fused * deep_lift(at.y);
+}
+// The eye's local adaptation to deep shade by day (gfx/tonemap.rs `PostParams::deep_lift`): where
+// the light around a pixel lies far under the preferred level (`below`, its stops from it), as
+// under a forest's canopy (a thousandth of paper white, eight stops under a sunlit face) while
+// the open sky holds the exposure down, it is lifted, up to `params.local_offset.z` stops.
+// Shadows within two and a half stops (a rock's under a noon sun, a room's corners) are left
+// alone: the global shadow lift (`params.local.y`) washed a sunny beach out long before it opened
+// a forest's understorey. The ramp spans twice the lift's stops, so its steepest part adds at
+// most three quarters of a stop per stop: a darker place never comes out brighter than a lighter
+// one, and the shade keeps a quarter of its contrast at least.
+fn deep_lift(below: f32) -> f32 {
+    let top = params.local_offset.z;
+    if top <= 0.0 { return 1.0; }
+    return exp2(top * smoothstep(-2.5, -2.5 - max(2.0 * top, 4.0), below));
 }
 
 // The eye's night vision (the Purkinje shift): in dim light its rods take over from its cones,

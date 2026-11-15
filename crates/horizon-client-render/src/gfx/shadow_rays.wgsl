@@ -398,6 +398,13 @@ var<private> fast_out: vec4<f32>;
 // Whether this frame's `trace` kept the last frame's sky (the bounced light's turns), so the fast
 // history's sky seen isn't fed the slow history's own value back.
 var<private> sky_rested: bool = false;
+// The frames between this surface's bounce rays (`trace`'s turns): 1 where it traces every frame.
+var<private> sky_turns: f32 = 1.0;
+// `HORIZON_RT_REST_MOMENT=0`: the light's second moment (the denoiser's variance) takes every
+// frame's, as before. By default a frame that kept the last frame's bounced light adds none (the
+// light it kept is the history's own, which hid the bounces' noise from the denoiser: the light
+// was found steady and left unfiltered, mottled), and a traced frame counts for its turns' frames.
+override REST_MOMENT: bool = true;
 // RT lighting's primary surface replacement on water (Remix's PSR, shadow_rays_hw.wgsl
 // `hw_reflect`): the light of what the water at the pixel reflects (rgb), a 1 a surface, 0 the
 // sky or no water (the water's shader then reflects its own sky).
@@ -956,9 +963,20 @@ fn sun_on(lifted: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 }
 // The rest of the light reaching a face at camera-relative `at`: the radiance cache's, else the
 // last frame's screen (w below 0: neither).
+// `HORIZON_RT_GI_ONE_BOUNCE=1` (a diagnosis): no light but the sun's at a bounce ray's hit, so
+// the bounced light can't feed itself back through the cache or the last frame.
+override GI_ONE_BOUNCE: bool = false;
+// `HORIZON_RT_GI_BOUNCE` (a diagnosis): 0 the cache, else the last frame's light (as always), 1
+// the cache only, 2 the last frame's only, 3 neither (a traced second bounce, else the open
+// sky's guess).
+override GI_BOUNCE: u32 = 0u;
 fn cached_on(at: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
-    let cached = cache_light(at, n);
-    if cached.a >= 0.0 { return cached; }
+    if GI_ONE_BOUNCE { return vec4(0.0, 0.0, 0.0, 1.0); }
+    if GI_BOUNCE != 2u && GI_BOUNCE != 3u {
+        let cached = cache_light(at, n);
+        if cached.a >= 0.0 { return cached; }
+    }
+    if GI_BOUNCE == 1u || GI_BOUNCE == 3u { return vec4(0.0, 0.0, 0.0, -1.0); }
     return last_light(at);
 }
 // The light leaving a surface at camera-relative `at` (normal `n`, colour `albedo`) toward where
@@ -1030,7 +1048,7 @@ fn last_light(at: vec3<f32>) -> vec4<f32> {
     let ndc = c.xy / c.w;
     if any(abs(ndc) > vec2(1.0)) { return vec4(0.0, 0.0, 0.0, -1.0); }
     let size = vec2<f32>(textureDimensions(last_mask));
-    let texel = clamp(vec2<i32>(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y)),
+    let texel = clamp(mask_texel_of(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y)),
         vec2(0), vec2<i32>(size) - 1);
     let d = length(q);
     let shown = textureLoad(last_mask, texel, 0).a;
@@ -1126,37 +1144,126 @@ fn last_gi(at: vec2<i32>) -> GiReservoir {
     let s = GiSample(a.xyz - rt.motion.xyz, normal, vec3(rg, bm.x));
     return GiReservoir(s, a.w, bm.y);
 }
-const GI_HISTORY: f32 = 20.0;
+// The candidates a reservoir carries over at most (`HORIZON_RT_GI_HISTORY`, 1 to 100; 20
+// without it), the neighbours' a quarter of it.
+override GI_HISTORY: f32 = 20.0;
+// Which reservoirs ReSTIR GI merges (`HORIZON_RT_GI_REUSE`, to tell what each adds): 0 the last
+// frame's and two neighbours', 1 the last frame's alone (`temporal`), 2 none (`none`: each frame's
+// own ray, unbiased, the light every other way should average to), 3 the neighbours' alone
+// (`spatial`).
+override GI_REUSE: u32 = 0u;
+// `HORIZON_RT_SKIP`'s bit for the neighbours' samples taken as if seen from this pixel's own point
+// (their Jacobian 1), as before: a sample a neighbour found right beside it (a wall's foot, a
+// corner) then counted as much of this pixel's view as of the neighbour's, its light smeared in
+// streaks from the corner and burning in fireflies along it.
+const SKIP_GI_JACOBIAN: u32 = 16777216u;
+// `HORIZON_RT_SKIP`'s bit for a pixel's normal from its nearer neighbours, as before
+// (`surface_normal`).
+const SKIP_NORMAL_NEAREST: u32 = 67108864u;
+// The most a neighbour's sample may weigh more, or less, for being seen from this pixel (RTXDI's
+// and Remix's bound): past it the two points see the sample too differently to share it.
+const GI_JACOBIAN_MAX: f32 = 10.0;
+// ReSTIR GI's Jacobian (Ouyang et al. 2021, eq. 11): how much larger the solid angle of sample
+// `s`'s surface is seen from camera-relative `to` than from `seer`, where the neighbour found it
+// (the cosines at the sample's face, the inverse squares of the distances); 0 where either point
+// lies in the sample's plane. The sky's samples are directions: 1.
+fn gi_jacobian(s: GiSample, seer: vec3<f32>, to: vec3<f32>) -> f32 {
+    let a = s.at - seer;
+    let b = s.at - to;
+    let da = dot(a, a);
+    let db = dot(b, b);
+    if da > 4000.0 * 4000.0 * 0.25 { return 1.0; }
+    if da < 1e-8 || db < 1e-8 { return 0.0; }
+    let cos_from = abs(dot(s.normal, a)) * inverseSqrt(da);
+    let cos_to = abs(dot(s.normal, b)) * inverseSqrt(db);
+    if cos_from < 1e-4 { return 0.0; }
+    return cos_to * da / (cos_from * db);
+}
+// Whether camera-relative `pos` sees sample point `at`: with hardware rays against the triangles
+// the sample was found on (`hw_visible`), else (and with `HORIZON_RT_GI_DDA=1`) through the voxel
+// grid, a long cave's ray taken as stopped once its budget is spent.
+fn gi_sees(pos: vec3<f32>, at: vec3<f32>) -> bool {
+    let to = at - pos;
+    let d = length(to);
+    let reach = select(d - 0.05, 1e30, d > 4000.0);
+    if HW && GI_HW_VISIBILITY {
+        return hw_visible(pos, to / d, min(reach, 4096.0));
+    }
+    return ray(pos, to / d, SKY_BUDGET, reach) >= 0.5;
+}
+// `HORIZON_RT_GI_NEIGHBOUR_RAYS=0`: the neighbours' samples merged unseen and only the chosen one
+// checked, as before (`restir_gi`); `reject` (a diagnosis): every neighbour's sample taken as
+// unseen, so the light must match `GI_REUSE` 1's if the rays run.
+override GI_NEIGHBOUR_RAYS: bool = true;
+override GI_NEIGHBOUR_REJECT: bool = false;
+// `HORIZON_RT_GI_SPATIAL_FEEDBACK=1`: the reservoir with the neighbours' samples merged is the one
+// the next frame takes over, as before (`restir_gi`).
+override GI_SPATIAL_FEEDBACK: bool = false;
 fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>, has_last: bool)
     -> vec4<f32> {
-    // The bounce pass's reservoir where it made one: the light it stands for, as below.
+    // The bounce pass's reservoir where it made one: with `GI_SPATIAL_FEEDBACK` the whole merge
+    // and the light it stands for, as below; without it the pixel's own sample merged with the
+    // last frame's reservoir only (the one the next frame takes over), the neighbours merged
+    // here for this frame's light.
+    var from_pass = false;
+    var pass_sky = 0.0;
+    var own = GiSample(vec3(0.0), vec3(0.0), vec3(0.0));
+    var chosen = own;
+    var aim = 0.0;
+    var sum = 0.0;
+    var seen = 1.0;
     if HW && pass_ran(2u) && sun_from_pass {
         let b = textureLoad(gi_pass_b, texel, 0);
         if b.w != 0u {
             let a = textureLoad(gi_pass_a, texel, 0);
-            gi_out_a = a;
-            gi_out_b = vec4(b.xyz, 0u);
             let rg = unpack2x16float(b.x);
             let bm = unpack2x16float(b.y);
-            let cosine = max(dot(n, normalize(a.xyz - pos)), 0.0);
-            return vec4(vec3(rg, bm.x) * cosine * a.w / 3.14159265, select(0.0, 1.0, b.w == 2u));
+            pass_sky = select(0.0, 1.0, b.w == 2u);
+            if GI_SPATIAL_FEEDBACK {
+                gi_out_a = a;
+                gi_out_b = vec4(b.xyz, 0u);
+                let cosine = max(dot(n, normalize(a.xyz - pos)), 0.0);
+                return vec4(vec3(rg, bm.x) * cosine * a.w / 3.14159265, pass_sky);
+            }
+            from_pass = true;
+            own = GiSample(a.xyz, unpack4x8snorm(b.z).xyz, vec3(rg, bm.x));
+            chosen = own;
+            aim = gi_target(own, pos, n);
+            seen = bm.y;
+            sum = a.w * seen * aim;
         }
     }
-    let own = gi_sample(pos, n, texel);
-    // The new candidate, drawn by the cosine: its weight its aim over that chance (pi cancels
-    // the cosine, Lambert's 1/pi is in the light's units).
-    var chosen = own;
-    var aim = gi_target(own, pos, n);
-    var sum = luminance(own.light) * 3.14159265;
-    var seen = 1.0;
+    if !from_pass {
+        own = gi_sample(pos, n, texel);
+        // The new candidate, drawn by the cosine: its weight its aim over that chance (pi
+        // cancels the cosine, Lambert's 1/pi is in the light's units).
+        chosen = own;
+        aim = gi_target(own, pos, n);
+        sum = luminance(own.light) * 3.14159265;
+    }
     var reused = false;
+    // Whether the chosen sample's visibility is known (a neighbour's, checked as it was merged).
+    var checked = false;
     // White (`random2`), not `blue2`: which candidate the reservoir keeps and which neighbours it
     // merges must not correlate with the neighbours' own choices (whose samples it takes).
     var u = random2(texel, 70u);
+    // The reservoir the next frame takes over (`GI_SPATIAL_FEEDBACK` off): the pixel's own sample
+    // and the last frame's alone, as the reservoir stood before the neighbours were merged.
+    var kept = chosen;
+    var kept_aim = aim;
+    var kept_sum = sum;
+    var kept_seen = seen;
     if has_last {
-        for (var j = 0; j < 3; j++) {
+        for (var j = select(0, 1, from_pass); j < 3; j++) {
+            if j == 1 {
+                kept = chosen;
+                kept_aim = aim;
+                kept_sum = sum;
+                kept_seen = seen;
+            }
             let jitter = random2(texel, 80u + u32(j));
             let off = select(vec2<i32>((jitter * 2.0 - 1.0) * 8.0), vec2(0), j == 0);
+            if GI_REUSE == 2u || (GI_REUSE == 1u && j > 0) || (GI_REUSE == 3u && j == 0) { continue; }
             let q = last_gi(last_at + off);
             if q.seen <= 0.0 || q.weight <= 0.0 { continue; }
             // The same surface: the face it showed and its distance (a floor's pixel doesn't take
@@ -1170,14 +1277,32 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
                     continue;
                 }
             }
-            // A neighbour a few texels away sees the sample from about the same point: the solid
-            // angle's change (the Jacobian) is taken as 1 (a gap from Remix's exact one, which
-            // needs the neighbour's own point; the visibility ray below keeps it honest).
+            // A neighbour's sample seen from this pixel's point: the solid angle's change (the
+            // Jacobian, as Remix's), from the neighbour's point as this frame's depth shows it
+            // (its texel lifted as this one), a sample it saw at a grazing angle or far closer
+            // than here (the wall beside a corner) left out. `SKIP_GI_JACOBIAN`: 1, as before.
+            var jacobian = 1.0;
+            if j > 0 && (SKIP & SKIP_GI_JACOBIAN) == 0u {
+                let lift = pos - surface_at(pixel_of(texel));
+                let there = surface_at(pixel_of(texel + off)) + lift;
+                jacobian = gi_jacobian(q.s, there, pos);
+                if jacobian > GI_JACOBIAN_MAX || jacobian < 1.0 / GI_JACOBIAN_MAX { continue; }
+            }
+            // A neighbour's sample this pixel doesn't see is left out before it is weighed. Merged
+            // unseen, its weight stayed in the reservoir's sum while another sample was kept (and
+            // when it was the one kept, the visibility ray below swapped in the pixel's own): a
+            // bright sample a neighbour saw through an opening (the sky, a sunlit patch) made the
+            // reservoir hold more light than the pixel gets, and the last frame's reservoir,
+            // merged again each frame, built it up (a lit room 2.7 times too bright, in blotches
+            // and streaks). The last frame's own sample was seen from this point already.
+            if j > 0 && GI_NEIGHBOUR_RAYS && (!gi_sees(pos, q.s.at) || GI_NEIGHBOUR_REJECT) {
+                continue;
+            }
             let p = gi_target(q.s, pos, n);
             // The neighbours' history counts for less than the pixel's own (no blotches of one
             // sample spread over a patch).
             let m = min(q.seen, select(GI_HISTORY / 4.0, GI_HISTORY, j == 0));
-            let w = p * q.weight * m;
+            let w = p * q.weight * m * jacobian;
             sum += w;
             seen += m;
             u = fract(u + vec2(0.618034, 0.754878));
@@ -1185,42 +1310,56 @@ fn restir_gi(pos: vec3<f32>, n: vec3<f32>, texel: vec2<i32>, last_at: vec2<i32>,
                 chosen = q.s;
                 aim = p;
                 reused = true;
+                checked = j > 0 && GI_NEIGHBOUR_RAYS;
             }
         }
     }
     var weight = 0.0;
     if aim > 0.0 { weight = sum / (seen * aim); }
-    // A sample from elsewhere: this pixel has to see it.
-    if reused && aim > 0.0 {
-        let to = chosen.at - pos;
-        let d = length(to);
-        let reach = select(d - 0.05, 1e30, d > 4000.0);
-        // With hardware rays against the triangles the sample was found on (`hw_visible`), else
-        // (and with `HORIZON_RT_GI_DDA=1`) through the voxel grid, a long cave's ray taken as
-        // stopped once its budget is spent.
-        var visible = true;
-        if HW && GI_HW_VISIBILITY {
-            visible = hw_visible(pos, to / d, min(reach, 4096.0));
-        } else {
-            visible = ray(pos, to / d, SKY_BUDGET, reach) >= 0.5;
-        }
-        if !visible {
+    // A sample from elsewhere: this pixel has to see it (the last frame's, a block placed since;
+    // a neighbour's was checked above unless `GI_NEIGHBOUR_RAYS` is off).
+    if reused && !checked && aim > 0.0 {
+        let visible = gi_sees(pos, chosen.at);
+        if !visible && from_pass {
+            // The pass's reservoir, as it stood before the neighbours.
+            chosen = kept;
+            aim = kept_aim;
+            weight = select(0.0, kept_sum / (kept_seen * kept_aim), kept_aim > 0.0);
+            seen = kept_seen;
+        } else if !visible {
             chosen = own;
             aim = gi_target(own, pos, n);
             weight = select(0.0, 3.14159265 * luminance(own.light) / aim, aim > 0.0);
             seen = 1.0;
         }
     }
+    // What the next frame takes over: with the neighbours' samples in it, as before
+    // (`HORIZON_RT_GI_SPATIAL_FEEDBACK=1`), or the reservoir before they were merged (ReSTIR GI's
+    // temporal reservoir, Ouyang et al.: the neighbours shade this frame only). Fed back each
+    // frame, the neighbours' merge and the last frame's, together with the bounced light that
+    // the cache and the last frame give a bounce ray's hit, lit a closed room ever brighter:
+    // in a controlled room on the 4090, several times the light of either reuse alone, which
+    // both matched the unreused light; one bounce alone matched too.
+    var stored = chosen;
+    var stored_weight = weight;
+    var stored_seen = seen;
+    if !GI_SPATIAL_FEEDBACK {
+        stored = kept;
+        stored_weight = select(0.0, kept_sum / (kept_seen * kept_aim), kept_aim > 0.0);
+        stored_seen = kept_seen;
+    }
     // Half floats past 65504 are infinite: the sample's light kept within them.
     chosen.light = min(finite3(chosen.light), vec3(60000.0));
     weight = min(finite(weight), 1e6);
-    gi_out_a = finite4(vec4(chosen.at, weight));
-    gi_out_b = vec4(pack2x16float(chosen.light.rg), pack2x16float(vec2(chosen.light.b, seen)),
-        pack4x8snorm(vec4(chosen.normal, 0.0)), 0u);
+    stored.light = min(finite3(stored.light), vec3(60000.0));
+    stored_weight = min(finite(stored_weight), 1e6);
+    gi_out_a = finite4(vec4(stored.at, stored_weight));
+    gi_out_b = vec4(pack2x16float(stored.light.rg), pack2x16float(vec2(stored.light.b, stored_seen)),
+        pack4x8snorm(vec4(stored.normal, 0.0)), 0u);
     let cosine = max(dot(n, normalize(chosen.at - pos)), 0.0);
     // The light the chosen sample stands for, in the diffuse light's units (Lambert's 1/pi).
     let light = chosen.light * cosine * weight / 3.14159265;
-    let sky = select(0.0, 1.0, length(own.at - pos) > 4000.0);
+    let sky = select(select(0.0, 1.0, length(own.at - pos) > 4000.0), pass_sky, from_pass);
     return vec4(light, sky);
 }
 // RT lighting's light sources: the light those of the cell holding camera-relative `pos` (on a face
@@ -1787,8 +1926,21 @@ fn surface_normal(p: vec2<i32>, pos: vec3<f32>) -> vec3<f32> {
     let l = pos - surface_at(p - vec2(1, 0));
     let d = surface_at(p + vec2(0, 1)) - pos;
     let u = pos - surface_at(p - vec2(0, 1));
-    let dx = select(l, r, dot(r, r) < dot(l, l));
-    let dy = select(u, d, dot(d, d) < dot(u, u));
+    var dx = select(l, r, dot(r, r) < dot(l, l));
+    var dy = select(u, d, dot(d, d) < dot(u, u));
+    // Each way, the side whose next pixel goes on in the same plane (the depth's straight line
+    // through two neighbours, after Wronski and atyuwen), not the nearer one: at a room's inner
+    // corner the wall's pixel can be the nearer, and the face's last pixels took a normal halfway
+    // between the ceiling's and the wall's, lit as neither (fireflies along the seam).
+    // `SKIP_NORMAL_NEAREST`: the nearer, as before.
+    if (SKIP & SKIP_NORMAL_NEAREST) == 0u {
+        let er = surface_at(p + vec2(2, 0)) - pos - 2.0 * r;
+        let el = pos - 2.0 * l - surface_at(p - vec2(2, 0));
+        let ed = surface_at(p + vec2(0, 2)) - pos - 2.0 * d;
+        let eu = pos - 2.0 * u - surface_at(p - vec2(0, 2));
+        dx = select(l, r, dot(er, er) < dot(el, el));
+        dy = select(u, d, dot(ed, ed) < dot(eu, eu));
+    }
     let n = normalize(cross(dx, dy));
     return select(n, -n, dot(n, pos) > 0.0);
 }
@@ -1925,7 +2077,9 @@ fn trace(p: vec2<i32>, texel: vec2<i32>) -> Traced {
         // seen, or past the grid's band, rests in turns as before (each frame's GI is most of
         // the kernel's cost).
         let cut = antilag_in(textureLoad(last_direct, back.xy, 0).a);
-        rest = rest && back.z == 1 && !cut && (SKIP & 16u) == 0u;
+        let turns = back.z == 1 && !cut && (SKIP & 16u) == 0u;
+        sky_turns = select(1.0, select(f32(1u << GI_TURN_BITS), 8.0, behind_psr), turns);
+        rest = rest && turns;
         sky_rested = rest;
         if rest {
             sky = vec4(textureLoad(last_blocks, back.xy, 0).rgb, textureLoad(last_mask, back.xy, 0).b);
@@ -1965,6 +2119,24 @@ fn tile_of(t: vec2<u32>, bits: u32) -> u32 {
     return k & ((1u << bits) - 1u);
 }
 // Where camera-relative `pos` was in the last frame's masks (xy), and z 1 when it showed it there.
+// Where in its mask texel the light a texel holds was found, in texels: a texel's surface is
+// `pixel_of`'s pixel, whose centre is half a pixel past the texel's centre when a texel spans an
+// even number of pixels (0.75 at 2x2). Read back as if at the centre (0.5), the last frame's light
+// came from a quarter texel right and down: the history's bilinear read took a quarter of the
+// texel there each frame, the frames resting between bounces (`trace`'s turns) without new light
+// to mend it, and the bounced light crept up and left, in diagonal streaks from every bright edge
+// (a doorway's lintel, a red wall's corner) until the turns' rays caught up. `HORIZON_RT_
+// REPROJECT_CENTRE=0` reads it at the centre, as before.
+override REPROJECT_CENTRE: bool = true;
+fn mask_sample_offset() -> f32 {
+    if !REPROJECT_CENTRE { return 0.5; }
+    let scale = i32(rt.size.z);
+    return (f32(scale / 2) + 0.5) / f32(scale);
+}
+// The last mask's texel holding camera-relative `q` once projected to its mask coordinates `at`.
+fn mask_texel_of(at: vec2<f32>) -> vec2<i32> {
+    return vec2<i32>(floor(at - mask_sample_offset() + 0.5));
+}
 fn restir_last(pos: vec3<f32>) -> vec3<i32> {
     if rt.motion.w < 0.5 { return vec3(0); }
     let q = pos + rt.motion.xyz;
@@ -1973,7 +2145,7 @@ fn restir_last(pos: vec3<f32>) -> vec3<i32> {
     let ndc = c.xy / c.w;
     if any(abs(ndc) > vec2(1.0)) { return vec3(0); }
     let size = vec2<f32>(textureDimensions(last_mask));
-    let at = vec2<i32>(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y));
+    let at = mask_texel_of(vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y));
     let last = textureLoad(last_mask, clamp(at, vec2(0), vec2<i32>(size) - 1), 0);
     let d = length(q);
     if last.a < 0.0 || abs(last.a - d) > 0.05 + 0.02 * d { return vec3(at, 0); }
@@ -2097,7 +2269,7 @@ fn accumulate(texel: vec2<i32>, traced: Traced) -> Traced {
     let ndc = c.xy / c.w;
     if any(abs(ndc) > vec2(1.0)) { return v; }
     let size = vec2<f32>(textureDimensions(last_mask));
-    let at = vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y) - 0.5;
+    let at = vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y) - mask_sample_offset();
     let base = vec2<i32>(floor(at));
     let f = at - floor(at);
     let d = length(q);
@@ -2228,8 +2400,14 @@ fn accumulate(texel: vec2<i32>, traced: Traced) -> Traced {
     return Traced(vec4(rays, v.rays.a),
         vec4(mix(slow_blocks, v.blocks.rgb, k), v.blocks.a),
         vec4(mix(slow_direct, v.direct.rgb, k), face + 8.0 * (n + select(0.0, 32.0, flag))),
-        vec4(sun_now.rgb, mix(slow_sun.a, v.sun.a, k)),
+        vec4(sun_now.rgb, mix(slow_sun.a, v.sun.a, moment_weight(k))),
         v.reservoir);
+}
+// The weight of this frame's second moment in the history (`REST_MOMENT`), `k` this frame's.
+fn moment_weight(k: f32) -> f32 {
+    if !REST_MOMENT { return k; }
+    if sky_rested { return 0.0; }
+    return min(k * sky_turns, 1.0);
 }
 // VR's second eye: the first eye's depth (its layer of the prepass both eyes share) and masks of
 // this frame (gfx/shadow_rays.rs `run`): its light once accumulated over its frames (not yet

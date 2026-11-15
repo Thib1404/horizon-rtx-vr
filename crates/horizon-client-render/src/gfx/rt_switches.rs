@@ -186,3 +186,42 @@ pub(super) struct EyeDepths {
     pub(super) covers: Option<([u32; 2], wgpu::TextureView, [wgpu::TextureView; 2])>,
     pub(super) next_cover: Option<wgpu::TextureView>,
 }
+/// The forest fixes' off switches, as bits in `Globals::rt_stream`'s w (which the meteors leave
+/// free; terrain.wgsl `rt_old`): 1 `HORIZON_RT_SKY_FRESNEL=old`, the sky's reflection by
+/// Schlick's Fresnel at the view's angle, as strong at a grazing view on a rough face as on a
+/// mirror (the frost-white sheen on leaves and grass toward the sun); 2 `HORIZON_RT_LEAF_SKY=0`,
+/// no sky light through leaves and plants (only the sun's), their undersides black under a
+/// canopy; 4 `HORIZON_RT_LEAF_LIGHT=old`, the light through a leaf in its colour twice and none
+/// through foliage without a pack.
+pub(super) fn rt_forest_bits() -> f32 {
+    static BITS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        forest_bits(
+            std::env::var("HORIZON_RT_SKY_FRESNEL").ok().as_deref(),
+            std::env::var("HORIZON_RT_LEAF_SKY").ok().as_deref(),
+            std::env::var("HORIZON_RT_LEAF_LIGHT").ok().as_deref(),
+        )
+    })
+}
+fn forest_bits(fresnel: Option<&str>, leaf_sky: Option<&str>, leaf_light: Option<&str>) -> f32 {
+    let old = |v: Option<&str>| v.is_some_and(|v| matches!(v.trim(), "old" | "0"));
+    let no_leaf_sky = leaf_sky.is_some_and(|v| v.trim() == "0");
+    f32::from(u8::from(old(fresnel)) | u8::from(no_leaf_sky) << 1 | u8::from(old(leaf_light)) << 2)
+}
+/// `Globals::rt_stream`: the meteors' stream (x to z) and `rt_forest_bits` in w.
+pub(super) fn rt_stream_with_switches(stream: [f32; 4]) -> [f32; 4] {
+    [stream[0], stream[1], stream[2], rt_forest_bits()]
+}
+
+#[cfg(test)]
+mod forest_tests {
+    #[test]
+    fn the_forest_switches_set_their_bits() {
+        assert_eq!(super::forest_bits(None, None, None), 0.0);
+        assert_eq!(super::forest_bits(Some("old"), None, None), 1.0);
+        assert_eq!(super::forest_bits(None, Some("0"), None), 2.0);
+        assert_eq!(super::forest_bits(None, None, Some("old")), 4.0);
+        assert_eq!(super::forest_bits(Some("0"), Some("0"), Some("0")), 7.0);
+        assert_eq!(super::forest_bits(Some("1"), Some("1"), Some("1")), 0.0);
+    }
+}

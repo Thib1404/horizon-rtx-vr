@@ -54,7 +54,10 @@ vec3 surface_at(ivec2 p) {
     return c.xyz / c.w;
 }
 
-// The kernel's `surface_normal`: from the nearer of the neighbours each way.
+// The pipeline's push constants (gi.rgen's): the flags' bit 6 the kernel's `SKIP_NORMAL_NEAREST`.
+layout(push_constant) uniform Push { uint sprite_split; uint flags; } push;
+
+// The kernel's `surface_normal`: the side whose next pixel goes on in the same plane each way.
 vec3 surface_normal(ivec2 p, vec3 pos) {
     vec3 r = surface_at(p + ivec2(1, 0)) - pos;
     vec3 l = pos - surface_at(p - ivec2(1, 0));
@@ -62,6 +65,16 @@ vec3 surface_normal(ivec2 p, vec3 pos) {
     vec3 u = pos - surface_at(p - ivec2(0, 1));
     vec3 dx = dot(r, r) < dot(l, l) ? r : l;
     vec3 dy = dot(d, d) < dot(u, u) ? d : u;
+    // The kernel's: the side whose next pixel goes on in the same plane (bit 6 of the flags, the
+    // kernel's `SKIP_NORMAL_NEAREST`: the nearer, as before).
+    if ((push.flags & 64u) == 0u) {
+        vec3 er = surface_at(p + ivec2(2, 0)) - pos - 2.0 * r;
+        vec3 el = pos - 2.0 * l - surface_at(p - ivec2(2, 0));
+        vec3 ed = surface_at(p + ivec2(0, 2)) - pos - 2.0 * d;
+        vec3 eu = pos - 2.0 * u - surface_at(p - ivec2(0, 2));
+        dx = dot(er, er) < dot(el, el) ? r : l;
+        dy = dot(ed, ed) < dot(eu, eu) ? d : u;
+    }
     vec3 n = normalize(cross(dx, dy));
     return dot(n, pos) > 0.0 ? -n : n;
 }

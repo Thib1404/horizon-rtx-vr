@@ -505,6 +505,45 @@ fn kernel(
                 ("EDGE_BAND", edge_band()),
                 ("HELD_LIGHT", held_light()),
                 ("HELD_REACH", held_reach()),
+                ("GI_REUSE", gi_reuse()),
+                ("GI_HISTORY", gi_history()),
+                ("GI_BOUNCE", f64::from(gi_bounce())),
+                (
+                    "REST_MOMENT",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_REST_MOMENT").as_deref() != Ok("0"),
+                    )),
+                ),
+                (
+                    "REPROJECT_CENTRE",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_REPROJECT_CENTRE").as_deref() != Ok("0"),
+                    )),
+                ),
+                (
+                    "GI_NEIGHBOUR_RAYS",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() != Ok("0"),
+                    )),
+                ),
+                (
+                    "GI_SPATIAL_FEEDBACK",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_SPATIAL_FEEDBACK").as_deref() == Ok("1"),
+                    )),
+                ),
+                (
+                    "GI_ONE_BOUNCE",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_ONE_BOUNCE").as_deref() == Ok("1"),
+                    )),
+                ),
+                (
+                    "GI_NEIGHBOUR_REJECT",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_GI_NEIGHBOUR_RAYS").as_deref() == Ok("reject"),
+                    )),
+                ),
             ],
             ..Default::default()
         },
@@ -543,11 +582,30 @@ fn denoiser(
                     )),
                 ),
                 ("SKIP", f64::from(skip & DENOISE_EARLY_OUT)),
+                // `HORIZON_RT_DENOISE_PLANE=0`: the taps' distance along the rays only, as before.
+                (
+                    "DENOISE_PLANE",
+                    f64::from(u8::from(
+                        std::env::var("HORIZON_RT_DENOISE_PLANE").as_deref() != Ok("0"),
+                    )),
+                ),
             ],
             ..Default::default()
         },
         cache: None,
     })
+}
+
+/// `HORIZON_RT_GI_BOUNCE` (a diagnosis, shadow_rays.wgsl `GI_BOUNCE`): the light at a bounce's hit
+/// besides the sun's from `cache` only, `screen` (the last frame's) only, or `traced` (neither: a
+/// second bounce); otherwise the cache, else the last frame's.
+pub fn gi_bounce() -> u32 {
+    match std::env::var("HORIZON_RT_GI_BOUNCE").as_deref() {
+        Ok("cache") => 1,
+        Ok("screen") => 2,
+        Ok("traced") => 3,
+        _ => 0,
+    }
 }
 
 /// `HORIZON_RT_SKIP`'s bit for the denoiser's early-out (denoise.wgsl `SKIP_EARLY_OUT`): set, every
@@ -1621,6 +1679,29 @@ fn edge_band() -> f64 {
         .unwrap_or(0.25)
 }
 
+/// Which reservoirs ReSTIR GI merges (shadow_rays.wgsl `GI_REUSE`): `HORIZON_RT_GI_REUSE=temporal`
+/// the last frame's alone, `none` none (each frame's own ray, the unbiased reference), `spatial`
+/// the neighbours' alone; otherwise
+/// the last frame's and two neighbours'.
+fn gi_reuse() -> f64 {
+    match std::env::var("HORIZON_RT_GI_REUSE").as_deref() {
+        Ok("temporal") => 1.0,
+        Ok("none") => 2.0,
+        Ok("spatial") => 3.0,
+        _ => 0.0,
+    }
+}
+
+/// The candidates a GI reservoir keeps at most (shadow_rays.wgsl `GI_HISTORY`,
+/// `HORIZON_RT_GI_HISTORY`, 1 to 100), 20 without it.
+fn gi_history() -> f64 {
+    std::env::var("HORIZON_RT_GI_HISTORY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| (1.0..=100.0).contains(v))
+        .unwrap_or(20.0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1707,6 +1788,7 @@ mod tests {
             let mut constants = naga::back::PipelineConstants::default();
             constants.insert("DEBUG".to_string(), 0.0);
             constants.insert("SHARE_GUARD".to_string(), 0.0);
+            constants.insert("DENOISE_PLANE".to_string(), 1.0);
             constants.insert(
                 "SKIP".to_string(),
                 f64::from(skip & super::DENOISE_EARLY_OUT),
