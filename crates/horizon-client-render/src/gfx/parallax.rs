@@ -32,7 +32,7 @@
 //! the thin layers at group [`GROUP`].
 
 use super::materials::MapArrays;
-use super::native_material::{NativeMaterial, TerrainShape};
+use super::native_material::{MaterialPipelines, NativeMaterial, TerrainShape};
 use super::wgsl_prefix::{TERRAIN, prefixed, section};
 
 /// The bind group of the normal, specular and subsurface maps and the thin layers.
@@ -711,9 +711,10 @@ fn bindings([normals, speculars, subsurfaces]: [u32; 3]) -> ([u32; 3], u32) {
 /// The parallax terrain shader for that many normal, specular and subsurface map arrays.
 /// The parallax shader over `arrays` map arrays, with the dual-source entry (`DUAL_ENTRY`) if `dual`.
 fn shader_source(arrays: [u32; 3], dual: bool) -> String {
-    // HDR lighting's functions ahead of the terrain's, as the native material stage takes them.
+    // HDR's look and lighting functions ahead of the terrain's, as the native material stage
+    // takes them.
     let terrain = prefixed(
-        &(include_str!("../hdr_light.wgsl").to_owned()
+        &(super::wgsl_prefix::HDR_LIGHT.to_owned()
             + section(TERRAIN, "struct Globals {", "// Sky (SkyRenderer)")),
         PREFIX,
     );
@@ -734,7 +735,7 @@ fn shader_source(arrays: [u32; 3], dual: bool) -> String {
 
 /// The parallax pipelines, and the bind group of the maps they read.
 pub struct Parallax {
-    pub pipelines: NativeMaterial,
+    pub pipelines: MaterialPipelines,
     pub group: wgpu::BindGroup,
 }
 

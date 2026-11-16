@@ -135,8 +135,9 @@ pub(super) fn open_xr_device(window: &Arc<Window>, offscreen: bool, layers: u32)
         configured: None,
     })
 }
-/// The pack's `request` under Linear Light (`linear`): no float frame of a shader API 0.2 pack
-/// or of HDR's layers, as the float scene is tone mapped into the frame (`tonemap`).
+/// The pack's `request` under Linear Light (`linear`): no float frame of a shader API 0.2 pack,
+/// as the float scene is tone mapped into the frame (`tonemap`); with HDR output that is HDR's
+/// float frame, which then shows the tone mapped world at paper white.
 pub(super) fn linear_light_request(
     linear: bool,
     request: output::FrameRequest,
@@ -144,7 +145,6 @@ pub(super) fn linear_light_request(
     if linear {
         output::FrameRequest {
             linear_pack: false,
-            hdr_float: false,
             ..request
         }
     } else {

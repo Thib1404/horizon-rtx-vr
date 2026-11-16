@@ -69,7 +69,7 @@ fn fixture(window: Arc<Window>) -> Result<(), Box<dyn std::error::Error>> {
         None,
         GraphicsApi::Vulkan,
         false,
-        true,
+        (true, true),
         false, // Linear Light off
         &horizon_client_render::graphics::Graphics::default(),
         Default::default(),

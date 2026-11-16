@@ -11,9 +11,8 @@
 //! auto-exposure (`exposure`) scales its light to the eye's adaptation and the bloom (`bloom`)
 //! lets the brightest of it glow. Both are measured on a chain of halved copies of the scene,
 //! and the grading pass writes the result into a float target of its own (`Post`), which the
-//! curve reads and HDR output reads in place of the scene (`graded`); when nothing reads it after
-//! (no HDR output, screenshot or video), the grading pass applies the curve itself, onto the
-//! screen's target. Env switches, for A/B: `HORIZON_POST=0` (no grading), `HORIZON_EXPOSURE=0`
+//! curve reads (and an F2 screenshot's HDR copy, `graded_texture`); when nothing reads it after
+//! (no screenshot or video), the grading pass applies the curve itself, onto the screen's target. Env switches, for A/B: `HORIZON_POST=0` (no grading), `HORIZON_EXPOSURE=0`
 //! (the exposure stays 1; a number is a fixed value in stops), `HORIZON_BLOOM=0` (a number is the
 //! bloom's burn intensity), `HORIZON_TONE_SHADOWS` and `_HIGHLIGHTS` (the local tone mapping's), `HORIZON_TONEMAP=shoulder` (today's curve in place of ACES) and
 //! `HORIZON_GRADE_FUSED=0` (the graded light's target and the curve's own pass every frame),
@@ -810,17 +809,7 @@ impl Tonemap {
         }
     }
 
-    /// The graded light of the scene of `size`, drawn by the last `run`: where HDR output reads
-    /// the scene when it is graded (its shadows applied: bind `no_mask` with it).
-    pub fn graded(&self, size: [u32; 2]) -> Option<&wgpu::TextureView> {
-        if !self.post {
-            return None;
-        }
-        let t = self.scenes.iter().find(|t| t.size == size)?;
-        t.post.as_ref().map(|p| &p.graded)
-    }
-
-    /// The graded light's texture of the scene of `size` (`graded`'s), for a screenshot.
+    /// The graded light's texture of the scene of `size` for a screenshot.
     pub fn graded_texture(&self, size: [u32; 2]) -> Option<&wgpu::Texture> {
         if !self.post {
             return None;
@@ -947,11 +936,6 @@ impl Tonemap {
                 },
             ],
         })
-    }
-
-    /// The mask bound without ray-traced shadows.
-    pub fn no_mask(&self) -> &wgpu::TextureView {
-        &self.no_mask
     }
 
     /// The scene target of `size` (made on first use).

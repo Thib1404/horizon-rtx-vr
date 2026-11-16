@@ -853,43 +853,65 @@ impl Renderer {
         let eye = {
             let shared = self.xr.clone().ok_or("no VR session")?;
             let xr = shared.lock().map_err(|_| "VR session poisoned")?;
-            // An HDR eye's image is scRGB: the window shows its 8-bit frame.
-            let sdr = self
+            // An HDR eye's image is scRGB: the window shows the frame it was drawn in.
+            let drawn = self
                 .eye_hdr
                 .first()
                 .and_then(|h| h.as_ref()?.last_frame())
                 .filter(|_| xr.eye_format() == wgpu::TextureFormat::Rgba16Float);
-            sdr.as_ref()
-                .unwrap_or(xr.eye_texture(xr_frame, 0))
-                .create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(format),
-                    ..Default::default()
-                })
+            match drawn {
+                Some(t) => t.create_view(&Default::default()),
+                None => xr
+                    .eye_texture(xr_frame, 0)
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(format),
+                        ..Default::default()
+                    }),
+            }
         };
-        // With HDR output the eye goes into HDR's 8-bit frame, which one pass writes to the
-        // swapchain at paper white: the eye is already tone mapped for the headset.
+        // With HDR output the eye goes into HDR's float frame, the HUD onto its layer, and one
+        // pass writes them to the swapchain at paper white: the eye is already tone mapped for
+        // the headset.
         let window = [self.config.width, self.config.height];
-        let screen = match &mut self.hdr {
-            Some(hdr) => hdr.frame(&self.device, window),
-            None => surface_frame.texture.clone(),
-        }
-        .create_view(&wgpu::TextureViewDescriptor {
-            format: Some(format),
-            ..Default::default()
-        });
+        let hdr_frame = (self.hdr.as_mut()).map(|hdr| hdr.frame(&self.device, window));
+        let (screen, screen_format) = match &hdr_frame {
+            Some(t) => (t.create_view(&Default::default()), t.format()),
+            None => (
+                surface_frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(format),
+                        ..Default::default()
+                    }),
+                format,
+            ),
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("VR mirror"),
             });
         super::gpu_passes::begin(&self.device, &mut encoder, "vr mirror");
+        if let Some(hdr) = &self.hdr {
+            hdr.begin(&self.queue, true);
+        }
         let group = self.world_post.bind(&self.device, &eye);
         self.world_post
-            .finish_with(&mut encoder, &screen, format, &group, None);
+            .finish_with(&mut encoder, &screen, screen_format, &group, None);
+        if let Some(hdr) = &self.hdr {
+            hdr.hud_backdrop(&mut encoder, None);
+        }
+        let hud = (self.hdr.as_ref())
+            .and_then(|h| h.hud())
+            .map(|t| t.create_view(&Default::default()));
+        let coverage = self.hdr.as_ref().and_then(|h| h.coverage_view());
+        if let Some(view) = &coverage {
+            super::hud_coverage::clear(&mut encoder, view);
+        }
         self.hud.draw_range(
             &mut encoder,
-            &screen,
-            None,
+            hud.as_ref().unwrap_or(&screen),
+            coverage.as_ref(),
             &self.depth,
             frame.hud,
             window,
@@ -897,13 +919,7 @@ impl Renderer {
             None,
         );
         if let Some(hdr) = &self.hdr {
-            hdr.present(
-                &self.queue,
-                &mut encoder,
-                &surface_frame.texture,
-                false,
-                None,
-            );
+            hdr.present(&self.queue, &mut encoder, &surface_frame.texture, None);
         }
         super::gpu_passes::stamp(&mut encoder, "mirror: scale and HUD");
         super::gpu_passes::end(&mut encoder);

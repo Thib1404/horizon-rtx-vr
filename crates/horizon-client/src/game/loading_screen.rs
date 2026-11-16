@@ -160,6 +160,7 @@ impl Loading {
             None,
             self.settings.horizon.api,
             self.settings.horizon.linear_light,
+            shader_packs::picked_pack_shape(&self.settings).ray_tracing,
         ) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
@@ -226,6 +227,7 @@ impl Loading {
             self.renderer.as_ref(),
             self.settings.horizon.api,
             self.settings.horizon.linear_light,
+            shader_packs::picked_pack_shape(&self.settings).ray_tracing,
         ) {
             Ok(r) => {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);

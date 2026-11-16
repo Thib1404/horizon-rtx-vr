@@ -110,7 +110,7 @@ pub(super) async fn open_device(
     window: &Arc<Window>,
     offscreen: bool,
     api: GraphicsApi,
-    layers: u32,
+    needs: surface_setup::DeviceNeeds,
 ) -> Result<Opened> {
     let wgpu_backend = std::env::var_os("WGPU_BACKEND").is_some();
     let tries = device_search(
@@ -123,13 +123,13 @@ pub(super) async fn open_device(
     // EXPERIMENTAL VR: the headset's device, where the first backend tried is Vulkan.
     if xr::wanted()
         && tries.first().and_then(|(order, _)| order.first()) == Some(&wgpu::Backends::VULKAN)
-        && let Some(opened) = open_xr_device(window, offscreen, layers)
+        && let Some(opened) = open_xr_device(window, offscreen, needs.layers)
     {
         return Ok(opened);
     }
     let mut first = None;
     for (order, allow_cpu) in tries {
-        match open_device_with(window, offscreen, &order, layers, allow_cpu).await {
+        match open_device_with(window, offscreen, &order, needs, allow_cpu).await {
             Ok(opened) => {
                 if let Some(first) = &first {
                     log::warn!(
@@ -182,7 +182,7 @@ pub(super) async fn open_device_with(
     window: &Arc<Window>,
     offscreen: bool,
     order: &[wgpu::Backends],
-    layers: u32,
+    needs: surface_setup::DeviceNeeds,
     allow_cpu: bool,
 ) -> Result<Opened> {
     let mut failures = Vec::new();
@@ -191,7 +191,7 @@ pub(super) async fn open_device_with(
         if attempt > 0 {
             log::warn!("Horizon renderer: trying {name} ({})", failures.join("; "));
         }
-        match open_with_retry(backends, window, offscreen, layers, allow_cpu).await {
+        match open_with_retry(backends, window, offscreen, needs, allow_cpu).await {
             Ok(opened) => return Ok(opened),
             Err(e) => failures.push(e),
         }
@@ -214,17 +214,17 @@ pub(super) async fn open_with_retry(
     backends: wgpu::Backends,
     window: &Arc<Window>,
     offscreen: bool,
-    layers: u32,
+    needs: surface_setup::DeviceNeeds,
     allow_cpu: bool,
 ) -> std::result::Result<Opened, String> {
-    match open_backend(backends, window, offscreen, false, layers, allow_cpu).await {
+    match open_backend(backends, window, offscreen, false, needs, allow_cpu).await {
         Err(NoDevice::NoAdapter(hidden)) => {
             log::warn!(
                 "Horizon renderer: {} has no conformant adapter ({hidden}); asking again for the \
                  ones wgpu hides as non-conformant",
                 backends_name(backends)
             );
-            match open_backend(backends, window, offscreen, true, layers, allow_cpu).await {
+            match open_backend(backends, window, offscreen, true, needs, allow_cpu).await {
                 Ok(opened) => {
                     let info = opened.adapter.get_info();
                     if is_broken_haswell_vulkan(&info) {
@@ -273,7 +273,7 @@ pub(super) async fn open_backend(
     window: &Arc<Window>,
     offscreen: bool,
     allow_nonconformant: bool,
-    layers: u32,
+    needs: surface_setup::DeviceNeeds,
     allow_cpu: bool,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
@@ -326,7 +326,7 @@ pub(super) async fn open_backend(
     let mut tried = Vec::new();
     let mut adapter = adapter;
     loop {
-        let why = match open_adapter(name, window, surface.as_ref(), &adapter, layers).await {
+        let why = match open_adapter(name, window, surface.as_ref(), &adapter, needs).await {
             Ok(adapted) => {
                 return Ok(Opened {
                     instance,

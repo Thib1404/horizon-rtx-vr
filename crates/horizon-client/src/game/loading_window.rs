@@ -33,7 +33,7 @@ pub(super) fn build_renderer(
     api: horizon_client::graphics::GraphicsApi,
     translucent_batching: bool,
     vsync: bool,
-    // HDR and Smooth Gradients pick the frame, with what the window's display reported to the
+    // HDR picks the frame, with what the window's display reported to the
     // renderer before (`display`, `Renderer::new`).
     settings: &horizon_client::graphics::Graphics,
     shader_pack: shader_packs::PickedPack,
@@ -76,7 +76,7 @@ pub(super) fn build_renderer(
         previous,
         api,
         translucent_batching,
-        shader_pack.draws_flat,
+        (shader_pack.draws_flat, shader_pack.starts_wide),
         linear,
         settings,
         shader_pack.frame(),
@@ -159,6 +159,7 @@ pub(super) fn loading_renderer(
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
     linear: bool,
+    rays: bool, // The startup pick declares `[ray_tracing]`: the world renderer keeps this device.
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
@@ -198,11 +199,14 @@ pub(super) fn loading_renderer(
         api,
         // It draws no terrain.
         false,
-        false,
+        (false, false),
         linear,
         // An 8-bit frame, which HDR output takes as well: HDR off until the settings apply.
         &horizon_client::graphics::Graphics::default(),
-        Default::default(),
+        horizon_client::gfx::FrameRequest {
+            ray_tracing: rays,
+            ..Default::default()
+        },
         previous.map(|r| r.display_reading()).unwrap_or_default(),
     ))?;
     if let Some(atlas) = atlas {

@@ -25,16 +25,13 @@ impl Renderer {
         } else {
             None
         };
-        // HDR output's layered frame keeps the world after the hand and the camera overlays,
-        // as light (`Hdr::layered`); else it is kept here, before them. With Linear Light HDR
-        // output keeps the world once it is tone mapped (below).
+        // HDR output's layered frame takes the hand and the camera overlays as light, with the
+        // world (`Hdr::layered`). With Linear Light the world reaches it already tone mapped
+        // (below), at paper white at most: HDR takes it as a frame without a world to lift, and
+        // its tone curve stays off.
         let layered = self.hdr.as_ref().is_some_and(|h| h.layered());
         if let Some(hdr) = &self.hdr {
-            if layered {
-                hdr.begin(&self.queue, !frame.title);
-            } else if scene.is_none() {
-                hdr.keep_world(encoder, timing.as_mut());
-            }
+            hdr.begin(&self.queue, !frame.title && scene.is_none());
         }
         if overlay.hand_quads > 0 {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -54,12 +51,7 @@ impl Renderer {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        // HDR output's hand marks test against it (below).
-                        store: if self.hdr.is_some() {
-                            wgpu::StoreOp::Store
-                        } else {
-                            wgpu::StoreOp::Discard
-                        },
+                        store: hand_depth_store(layered),
                     }),
                     stencil_ops: None,
                 }),
@@ -70,50 +62,6 @@ impl Renderer {
             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
             pass.draw_indexed(0..overlay.hand_quads * 6, overlay.first_hand_vertex, 0..1);
-            drop(pass);
-            if let Some(hdr) = &self.hdr
-                && !no_pack_hdr_gain(layered, self.shader_pack_kind().is_some(), !frame.title)
-            {
-                hdr.mark_hand(encoder, timing.as_mut());
-                // The non-layered 0.2 hand keeps its UI-brightness sentinel, not light marks.
-                if light_marks(self.output.frame.format, true)
-                    && let Some(view) = hdr.hand_light_view()
-                {
-                    // The light sources in the hand may shine, the rest of it stays at the
-                    // world's brightness: nothing the world kept here shows through it.
-                    let attachments = [Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })];
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("HDR hand marks"),
-                        timestamp_writes: timing.as_mut().and_then(|t| t.writes("HDR hand marks")),
-                        color_attachments: &attachments,
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &self.depth,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Discard,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        ..Default::default()
-                    });
-                    pass.set_bind_group(0, &self.hand_group, &[]);
-                    pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
-                    let quads = 0..overlay.hand_quads * 6;
-                    pass.set_pipeline(&self.hdr_hand_unmark_pipeline);
-                    pass.draw_indexed(quads.clone(), overlay.first_hand_vertex, 0..1);
-                    pass.set_pipeline(&self.hdr_hand_mark_pipeline);
-                    pass.draw_indexed(quads, overlay.first_hand_vertex, 0..1);
-                }
-            }
         }
         // A native mod's turn after the hand, on the real frame only.
         if overlay.real && !frame.title {
@@ -162,12 +110,8 @@ impl Renderer {
         }
         // The layered frame's light eases into the peak, before the camera overlays draw on it,
         // unless a 0.2 pack's own `[tonemap]` did.
-        let pack_tonemap = self
-            .native
-            .as_ref()
-            .and_then(|n| n.post.as_ref())
-            .is_some_and(native_post::NativePost::tonemaps);
-        if horizon_tone_curve(layered, !frame.title, pack_tonemap)
+        let pack_tonemap = self.native.as_ref().is_some_and(|n| n.tonemaps());
+        if horizon_tone_curve(layered, !frame.title && scene.is_none(), pack_tonemap)
             && let Some(hdr) = &self.hdr
         {
             hdr.tonemap(encoder, timing.as_mut());
@@ -196,50 +140,12 @@ impl Renderer {
                     crate::screen_effects::Blend::Alpha => 0,
                     crate::screen_effects::Blend::Vignette => 4,
                 };
-                let tint = if quad.world_tint && self.hdr.is_some() {
-                    8
-                } else {
-                    0
-                };
-                pass.set_pipeline(
-                    &self.screen_pipelines[tint + blend + (quad.sampling & 3) as usize],
-                );
+                pass.set_pipeline(&self.screen_pipelines[blend + (quad.sampling & 3) as usize]);
                 pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
             }
-            drop(pass);
-            // A tint leaves the frame's alpha and goes over the kept world too: light sources
-            // under water still show the world, and still shine.
-            if let Some(view) = self.hdr.as_ref().and_then(|h| h.hand_light_view())
-                && frame.screen.iter().any(|quad| quad.world_tint)
-            {
-                let attachments = [Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })];
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Screen tints over the kept world"),
-                    timestamp_writes: None,
-                    color_attachments: &attachments,
-                    ..Default::default()
-                });
-                pass.set_bind_group(0, &self.entity_group, &[]);
-                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.set_vertex_buffer(0, self.screen_buffer.slice(..));
-                for (i, quad) in frame.screen.iter().enumerate() {
-                    if quad.world_tint {
-                        pass.set_pipeline(&self.screen_pipelines[8 + (quad.sampling & 3) as usize]);
-                        pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
-                    }
-                }
-            }
         }
-        if layered && let Some(hdr) = &self.hdr {
-            hdr.keep_world(encoder, timing.as_mut());
+        if let Some(hdr) = &self.hdr {
+            hdr.hud_backdrop(encoder, timing.as_mut());
         }
         // What the HUD and menus draw on: the layered frame's HUD target, else the frame.
         let hud = self
@@ -298,11 +204,10 @@ impl Renderer {
         if let Some((_, size, mask)) = scene
             && let Some(t) = &self.tonemap
         {
-            // The graded light is read after when HDR output presents it, or a screenshot or a
-            // video frame keeps it: else the curve draws in the grading's pass.
-            let keep_graded = self.hdr.is_some()
-                || self.screenshot.is_some()
-                || self.recording.as_ref().is_some_and(|r| r.wants());
+            // The graded light is read after when a screenshot or a video frame keeps it: else
+            // the curve draws in the grading's pass.
+            let keep_graded =
+                self.screenshot.is_some() || self.recording.as_ref().is_some_and(|r| r.wants());
             t.run(
                 &self.device,
                 encoder,
@@ -313,9 +218,6 @@ impl Renderer {
                 None,
                 None,
             );
-            if let Some(hdr) = &self.hdr {
-                hdr.keep_world(encoder, timing.as_mut());
-            }
             self.apply_post_effects(
                 encoder,
                 frame,
@@ -364,7 +266,7 @@ impl Renderer {
                         radius,
                         timing.as_mut(),
                     );
-                    hdr.keep_world(encoder, timing.as_mut());
+                    hdr.hud_backdrop(encoder, timing.as_mut());
                 }
                 None => blur.apply(
                     device,
